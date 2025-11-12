@@ -157,9 +157,11 @@ class FluxEquilibriumClustering:
                 labels[i] = sink_map[curr]
             else:
                 labels[i] = -1  # outlier/unassigned
+        sink_mask = np.zeros(n, dtype=bool)
+        sink_mask[sinks] = True
         self.w_ij = w_ij
         self.flux = flux
-        self.sinks = np.array(sinks)
+        self.sinks = sink_mask  # << THIS IS THE MAIN CHANGE!
         self.labels = labels
         return self
 
