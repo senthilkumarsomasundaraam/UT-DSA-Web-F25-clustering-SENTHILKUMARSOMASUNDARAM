@@ -29,14 +29,6 @@ class FluxEquilibriumClustering:
         * ``beta is None``  –  use ``phi(f) = log(1+f)`` (recommended).
         * ``beta = 0``      –  recovers the *original* FEC behaviour.
         * any other value   –  use ``phi(f) = f**beta``.
-
-    Notes
-    -----
-    Implementation hints for better clustering:
-    - Handle small datasets: ensure k <= n-1 to avoid boundary errors
-    - Consider relaxed downhill flow: allow flux to similar-distance neighbors
-    - Add cycle detection in path-following to prevent infinite loops
-    - Post-process: merge very small clusters with nearest larger ones
     """
 
     def __init__(
@@ -56,29 +48,20 @@ class FluxEquilibriumClustering:
         self.epsilon = epsilon
         self.beta = beta
 
-        # Attributes filled after fit()
+        # Attributes set after fit()
         self.labels = None
         self.w_ij = None
         self.flux = None
         self.sinks = None
 
     def fit(self, X: np.ndarray) -> "FluxEquilibriumClustering":
-        """Compute cluster labels for X using flux-based equilibrium.
-
-        Implementation steps:
-        1. Build k-NN graph with Gaussian weights
-        2. Initialize flux
-        3. Run T flux transport iterations
-        4. Identify sinks as local maxima of flux
-        5. Assign cluster labels by steepest flux ascent to sink
-        """
-
+        """Compute cluster labels for X using flux-based equilibrium."""
         n = X.shape[0]
 
         # --- Step 1: Build k-NN graph ---
         dists = np.linalg.norm(X[:, None] - X[None], axis=2)
         effective_k = min(self.k, n - 1)
-        knn_idx = np.argsort(dists, axis=1)[:, 1:effective_k + 1]  # skip self
+        knn_idx = np.argsort(dists, axis=1)[:, 1:effective_k + 1]
 
         # Determine sigma if not provided
         if self.sigma is None:
@@ -88,18 +71,18 @@ class FluxEquilibriumClustering:
             sigma = self.sigma
         self.sigma = sigma
 
-        # Gaussian edge weights for k-NN
+        # Gaussian edge weights
         w_ij = np.zeros((n, effective_k))
         for i in range(n):
             for idx, j in enumerate(knn_idx[i]):
                 w_ij[i, idx] = np.exp(-((dists[i, j] / sigma) ** 2))
 
-        # Optional non-linear reinforcement
+        # Non-linear reinforcement
         if self.beta is not None:
             if self.beta != 0:
                 w_ij = np.power(w_ij, self.beta)
         else:
-            w_ij = np.log1p(w_ij)  # default: log(1 + w)
+            w_ij = np.log1p(w_ij)
 
         # --- Step 2: Initialize flux ---
         flux = np.ones(n)
@@ -110,40 +93,45 @@ class FluxEquilibriumClustering:
             for i in range(n):
                 neighbors = knn_idx[i]
                 weights = w_ij[i]
-                weighted_sum = np.sum(weights * flux[neighbors])
-                total_weight = np.sum(weights) + 1e-9  # avoid divide by zero
-                # Update flux: retain (1-alpha) + redistribute alpha to neighbors
-                new_flux[i] = (1 - self.alpha) * flux[i] + self.alpha * weighted_sum / total_weight
+
+                # Flux redistribution to neighbors
+                downhill = [j for j in neighbors if dists[i, j] > 0]  # allow all neighbors
+                if downhill:
+                    out_share = self.alpha * flux[i] / len(downhill)
+                    for j in downhill:
+                        new_flux[j] += out_share
+                    new_flux[i] += flux[i] * (1 - self.alpha)
+                else:
+                    new_flux[i] += flux[i]
             flux = new_flux
 
-        # Normalize flux for test consistency
+        # Normalize flux
         flux = flux / np.max(flux) * 8.0
 
-        # --- Step 4: Identify sinks (local maxima of flux) ---
+        # --- Step 4: Sink detection (relaxed) ---
         sinks = []
         for i in range(n):
-            neighbor_flux = flux[knn_idx[i]]
-            if np.all(flux[i] >= neighbor_flux - self.epsilon):
+            outgoing = flux[knn_idx[i]] - flux[i]
+            if np.all(outgoing < self.epsilon):
                 sinks.append(i)
 
-        # --- Step 5: Assign cluster labels ---
+        # --- Step 5: Assign labels via steepest flux path to sinks ---
         labels = -np.ones(n, dtype=int)
         sink_map = {sink: idx for idx, sink in enumerate(sinks)}
-
         for i in range(n):
             visited = set()
             curr = i
             while curr not in sinks:
                 visited.add(curr)
                 neighbors = knn_idx[curr]
-                # Move to neighbor with max flux (steepest ascent)
+                # move to neighbor with highest flux
                 next_c = neighbors[np.argmax(flux[neighbors])]
                 if next_c in visited:
-                    break  # cycle detection
+                    break
                 curr = next_c
             labels[i] = sink_map.get(curr, -1)
 
-        # Store attributes for testing
+        # Store attributes for tests
         sink_mask = np.zeros(n, dtype=bool)
         sink_mask[sinks] = True
 
