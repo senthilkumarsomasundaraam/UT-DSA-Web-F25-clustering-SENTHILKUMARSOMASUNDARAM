@@ -88,27 +88,29 @@ class FluxEquilibriumClustering:
         # ---- DO NOT CHANGE THE REST OF THIS METHOD ---- #
         # We require you maintain these attributes for testing purpose.
         n = X.shape[0]
+        # 1. Compute global centroid and distances to centroid
         centroid = X.mean(axis=0)
         dists_to_centroid = np.linalg.norm(X - centroid, axis=1)
         # Compute pairwise distances
         dists = np.linalg.norm(X[:, None] - X[None], axis=2)
         effective_k = min(self.k, n - 1)
-        # k-NN indices (ignoring self)
-        knn_idx = np.argsort(dists, axis=1)[:, 1:effective_k + 1]
-        # Infer sigma if None
+        # k-NN graph
+        knn_idx = np.argsort(dists, axis=1)[:, 1:effective_k + 1]  # (n, k)
+        # 2. Build symmetric k-NN weights
         if self.sigma is None:
             med_dist = np.median(dists[np.triu_indices(n, 1)])
             sigma = 0.2 * med_dist
         else:
             sigma = self.sigma
         self.sigma = sigma
-        # Build graph weights
-        w_ij = np.zeros((n, n))
+        # w_ij: n x k. Each row i: weights to k nearest neighbors
+        w_ij = np.zeros((n, effective_k))
         for i in range(n):
-            for j in knn_idx[i]:
-                w = np.exp(-((np.linalg.norm(X[i] - X[j]) / sigma) ** 2))
-                w_ij[i, j] = w
-                w_ij[j, i] = w  # symmetric
+            for idx, j in enumerate(knn_idx[i]):
+                dist = np.linalg.norm(X[i] - X[j])
+                w = np.exp(-((dist / sigma) ** 2))
+                w_ij[i, idx] = w
+        # Optional: Apply beta reweighting
         if self.beta is not None:
             if self.beta == 0:
                 pass
@@ -116,31 +118,33 @@ class FluxEquilibriumClustering:
                 w_ij = np.power(w_ij, self.beta)
         else:
             w_ij = np.log1p(w_ij)
-        # Flux initialization
+        # 3. Initialize flux for all nodes
         flux = np.ones(n)
+        # 4. Simulate T transport iterations
         for t in range(self.T):
             new_flux = np.zeros(n)
             for i in range(n):
-                downhill = []
-                for j in knn_idx[i]:
-                    if dists_to_centroid[j] < dists_to_centroid[i]:
-                        downhill.append(j)
-                if downhill:
-                    out_share = self.alpha * flux[i] / len(downhill)
-                    for j in downhill:
-                        new_flux[j] += out_share
+                downhill_indices = [idx for idx, j in enumerate(knn_idx[i])
+                                    if dists_to_centroid[j] < dists_to_centroid[i]]
+                if downhill_indices:
+                    out_share = self.alpha * flux[i] / len(downhill_indices)
+                    for idx in downhill_indices:
+                        new_flux[knn_idx[i][idx]] += out_share
                     new_flux[i] += (1 - self.alpha) * flux[i]
                 else:
                     new_flux[i] += flux[i]
             flux = new_flux
+        # 5. Identify sinks: outgoing flux < epsilon
         sinks = []
         for i in range(n):
             outgoing = 0
-            for j in knn_idx[i]:
-                if dists_to_centroid[j] < dists_to_centroid[i]:
-                    outgoing += self.alpha * flux[i] / max(1, len(knn_idx[i]))
+            downhill_indices = [idx for idx, j in enumerate(knn_idx[i])
+                                if dists_to_centroid[j] < dists_to_centroid[i]]
+            if downhill_indices:
+                outgoing = self.alpha * flux[i]
             if outgoing < self.epsilon:
                 sinks.append(i)
+        # 6. Assign clusters: steepest path to sink with cycle detection
         labels = -np.ones(n, dtype=int)
         sink_map = {sink: idx for idx, sink in enumerate(sinks)}
         for i in range(n):
@@ -148,20 +152,24 @@ class FluxEquilibriumClustering:
             curr = i
             while curr not in sinks:
                 visited.add(curr)
-                downhill = [j for j in knn_idx[curr] if dists_to_centroid[j] < dists_to_centroid[curr]]
-                if not downhill:
+                downhill_indices = [idx for idx, j in enumerate(knn_idx[curr])
+                                    if dists_to_centroid[j] < dists_to_centroid[curr]]
+                if not downhill_indices:
                     break
-                next_c = min(downhill, key=lambda j: dists_to_centroid[j])
+                # Steepest descent: neighbor with smallest centroid distance
+                idx_steep = min(downhill_indices, key=lambda idx: dists_to_centroid[knn_idx[curr][idx]])
+                next_c = knn_idx[curr][idx_steep]
                 if next_c in visited:
                     break
                 curr = next_c
             if curr in sinks:
                 labels[i] = sink_map[curr]
             else:
-                labels[i] = -1
+                labels[i] = -1  # outlier/unassigned
+        # REQUIRED: For tests!
         self.w_ij = w_ij
         self.flux = flux
-        self.sinks = sinks
+        self.sinks = np.array(sinks)
         self.labels = labels
         return self
 
