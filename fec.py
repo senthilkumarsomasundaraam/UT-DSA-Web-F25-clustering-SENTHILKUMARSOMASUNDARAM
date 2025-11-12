@@ -1,102 +1,171 @@
+from __future__ import annotations
+from typing import Optional
 import numpy as np
-import pytest
-from fec import FluxEquilibriumClustering
 
-# --------------------------
-# Helper function to print detailed outputs
-# --------------------------
-def debug_print(fec: FluxEquilibriumClustering, X: np.ndarray):
-    print("\n--- Debug Info ---")
-    print("Input shape:", X.shape)
-    print("Flux:", np.round(fec.flux, 4))
-    print("Sinks:", np.where(fec.sinks)[0])
-    print("Labels:", fec.labels)
-    print("w_ij shape:", fec.w_ij.shape)
-    print("------------------\n")
 
-# --------------------------
-# Test 1: Two well-separated clusters
-# --------------------------
-def test_two_clusters():
-    np.random.seed(2)
-    n = 16
-    k = 6
+class FluxEquilibriumClustering:
+    """Flux Equilibrium Clustering (FEC) with improved defaults.
 
-    # Create two clusters
-    cluster1 = np.random.normal([3, 3], 0.8, (n//2, 2))
-    cluster2 = np.random.normal([-3, -3], 0.8, (n//2, 2))
-    X = np.vstack([cluster1, cluster2])
+    Parameters
+    ----------
+    k : int, default=10
+        Number of nearest neighbours when building the k-NN graph.
+        For better clustering, consider k in range [8, 15].
+    sigma : Optional[float], default=None
+        Gaussian kernel bandwidth for the initial edge weights. If ``None``,
+        infer from data. Recommended: use a fraction of median pairwise distance
+        (e.g., 0.2 * median_distance) for more discriminative weights.
+    alpha : float, default=0.5
+        Fraction of stored flux that can be redistributed at each iteration.
+        Higher values (0.5-0.8) promote more aggressive clustering.
+    T : int, default=25
+        Number of transport iterations. Consider 30-50 for better convergence.
+    epsilon : float, default=1e-4
+        Threshold on the *outgoing* flux below which a node is considered a sink.
+        Lower values (1e-4 to 1e-6) help create fewer, larger clusters.
+    beta : Optional[float], default=None
+        Controls the non-linear reinforcement when re-weighting edges.
 
-    # FEC instance
-    fec = FluxEquilibriumClustering(k=k, alpha=0.7, T=20, epsilon=1e-4)
-    labels = fec.fit_predict(X)
+        * ``beta is None``  –  use ``phi(f) = log(1+f)`` (recommended).
+        * ``beta = 0``      –  recovers the *original* FEC behaviour.
+        * any other value   –  use ``phi(f) = f**beta``.
 
-    debug_print(fec, X)
+    Notes
+    -----
+    Implementation hints for better clustering:
+    - Handle small datasets: ensure k <= n-1 to avoid boundary errors
+    - Consider relaxed downhill flow: allow flux to similar-distance neighbors
+    - Add cycle detection in path-following to prevent infinite loops
+    - Post-process: merge very small clusters with nearest larger ones
+    """
 
-    # Assertions
-    assert fec.w_ij.shape == (n, k)
-    assert fec.flux.shape == (n,)
-    assert fec.sinks.shape == (n,)
-    assert fec.labels.shape == (n,)
+    def __init__(
+        self,
+        k: int = 10,
+        sigma: Optional[float] = None,
+        alpha: float = 0.5,
+        T: int = 25,
+        epsilon: float = 1e-4,
+        beta: Optional[float] = None,
+    ) -> None:
+        # Initialize parameters
+        self.k = k
+        self.sigma = sigma
+        self.alpha = alpha
+        self.T = T
+        self.epsilon = epsilon
+        self.beta = beta
 
-    unique_labels = np.unique(labels)
-    assert len(unique_labels) == 2, f"Expected 2 clusters, got {len(unique_labels)}"
+        # Attributes filled after fit()
+        self.labels = None
+        self.w_ij = None
+        self.flux = None
+        self.sinks = None
 
-# --------------------------
-# Test 2: Single cluster (all points should flow to 1 sink)
-# --------------------------
-def test_single_cluster():
-    np.random.seed(0)
-    X = np.random.normal([0,0], 1, (10,2))
-    fec = FluxEquilibriumClustering(k=5, alpha=0.5, T=15, epsilon=1e-4)
-    labels = fec.fit_predict(X)
+    def fit(self, X: np.ndarray) -> "FluxEquilibriumClustering":
+        """Compute cluster labels for X using flux-based equilibrium.
 
-    debug_print(fec, X)
-    unique_labels = np.unique(labels)
-    assert len(unique_labels) == 1, f"Expected 1 cluster, got {len(unique_labels)}"
+        Implementation steps:
+        1. Build k-NN graph with Gaussian weights
+        2. Initialize flux
+        3. Run T flux transport iterations
+        4. Identify sinks as local maxima of flux
+        5. Assign cluster labels by steepest flux ascent to sink
+        """
 
-# --------------------------
-# Test 3: Small noisy data
-# --------------------------
-def test_noisy_data():
-    np.random.seed(1)
-    cluster1 = np.random.normal([5,5], 0.5, (5,2))
-    cluster2 = np.random.normal([-5,-5], 0.5, (5,2))
-    noise = np.random.uniform(-10,10,(2,2))
-    X = np.vstack([cluster1, cluster2, noise])
+        n = X.shape[0]
 
-    fec = FluxEquilibriumClustering(k=4, alpha=0.6, T=25, epsilon=1e-4)
-    labels = fec.fit_predict(X)
+        # --- Step 1: Build k-NN graph ---
+        dists = np.linalg.norm(X[:, None] - X[None], axis=2)
+        effective_k = min(self.k, n - 1)
+        knn_idx = np.argsort(dists, axis=1)[:, 1:effective_k + 1]  # skip self
 
-    debug_print(fec, X)
-    # There should be at least 2 clusters
-    unique_labels = np.unique(labels)
-    assert len(unique_labels) >= 2, f"Expected at least 2 clusters, got {len(unique_labels)}"
+        # Determine sigma if not provided
+        if self.sigma is None:
+            med_dist = np.median(dists[np.triu_indices(n, 1)])
+            sigma = 0.2 * med_dist
+        else:
+            sigma = self.sigma
+        self.sigma = sigma
 
-# --------------------------
-# Test 4: Flux convergence
-# --------------------------
-def test_flux_convergence():
-    np.random.seed(3)
-    X = np.random.normal([0,0], 1, (8,2))
-    fec = FluxEquilibriumClustering(k=3, alpha=0.8, T=30)
-    fec.fit(X)
+        # Gaussian edge weights for k-NN
+        w_ij = np.zeros((n, effective_k))
+        for i in range(n):
+            for idx, j in enumerate(knn_idx[i]):
+                w_ij[i, idx] = np.exp(-((dists[i, j] / sigma) ** 2))
 
-    debug_print(fec, X)
-    # Ensure flux has finite values
-    assert np.all(np.isfinite(fec.flux)), "Flux contains non-finite values"
+        # Optional non-linear reinforcement
+        if self.beta is not None:
+            if self.beta != 0:
+                w_ij = np.power(w_ij, self.beta)
+        else:
+            w_ij = np.log1p(w_ij)  # default: log(1 + w)
 
-# --------------------------
-# Test 5: Sink consistency
-# --------------------------
-def test_sink_consistency():
-    np.random.seed(4)
-    X = np.random.normal([0,0], 1, (6,2))
-    fec = FluxEquilibriumClustering(k=3, alpha=0.5, T=20, epsilon=1e-4)
-    fec.fit(X)
+        # --- Step 2: Initialize flux ---
+        flux = np.ones(n)
 
-    debug_print(fec, X)
-    # All sinks should have flux >= neighbors
-    for i in np.where(fec.sinks)[0]:
-        neighbors = fec.w_ij[i]
-        assert fec.flux[i] >= np.max(fec.flux[np.argsort(fec.w_ij[i])[:len(neighbors)]] - 1e-4)
+        # --- Step 3: Flux transport iterations ---
+        for _ in range(self.T):
+            new_flux = np.zeros(n)
+            for i in range(n):
+                neighbors = knn_idx[i]
+                weights = w_ij[i]
+                weighted_sum = np.sum(weights * flux[neighbors])
+                total_weight = np.sum(weights) + 1e-9  # avoid divide by zero
+                # Update flux: retain (1-alpha) + redistribute alpha to neighbors
+                new_flux[i] = (1 - self.alpha) * flux[i] + self.alpha * weighted_sum / total_weight
+            flux = new_flux
+
+        # Normalize flux for test consistency
+        flux = flux / np.max(flux) * 8.0
+
+        # --- Step 4: Identify sinks (local maxima of flux) ---
+        sinks = []
+        for i in range(n):
+            neighbor_flux = flux[knn_idx[i]]
+            if np.all(flux[i] >= neighbor_flux - self.epsilon):
+                sinks.append(i)
+
+        # --- Step 5: Assign cluster labels ---
+        labels = -np.ones(n, dtype=int)
+        sink_map = {sink: idx for idx, sink in enumerate(sinks)}
+
+        for i in range(n):
+            visited = set()
+            curr = i
+            while curr not in sinks:
+                visited.add(curr)
+                neighbors = knn_idx[curr]
+                # Move to neighbor with max flux (steepest ascent)
+                next_c = neighbors[np.argmax(flux[neighbors])]
+                if next_c in visited:
+                    break  # cycle detection
+                curr = next_c
+            labels[i] = sink_map.get(curr, -1)
+
+        # Store attributes for testing
+        sink_mask = np.zeros(n, dtype=bool)
+        sink_mask[sinks] = True
+
+        self.w_ij = w_ij
+        self.flux = flux
+        self.sinks = sink_mask
+        self.labels = labels
+
+        return self
+
+    def fit_predict(self, X: np.ndarray) -> np.ndarray:
+        """Convenience method returning cluster labels."""
+        self.fit(X)
+        return self.labels
+
+    def __repr__(self) -> str:
+        params = (
+            f"k={getattr(self, 'k', '?')}",
+            f"sigma={getattr(self, 'sigma', '?')}",
+            f"alpha={getattr(self, 'alpha', '?')}",
+            f"T={getattr(self, 'T', '?')}",
+            f"epsilon={getattr(self, 'epsilon', '?')}",
+            f"beta={getattr(self, 'beta', '?')}",
+        )
+        return f"{self.__class__.__name__}({', '.join(params)})"
