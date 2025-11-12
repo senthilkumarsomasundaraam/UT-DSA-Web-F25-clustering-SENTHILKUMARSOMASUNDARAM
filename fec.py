@@ -71,22 +71,18 @@ class FluxEquilibriumClustering:
         """
         n = X.shape[0]
 
-        # ---------------------------------------------------------------------
-        # 1. Compute pairwise distances and nearest neighbors
-        # ---------------------------------------------------------------------
+        # 1️Compute centroid and distances
         centroid = X.mean(axis=0)
         dists_to_centroid = np.linalg.norm(X - centroid, axis=1)
         dists = np.linalg.norm(X[:, None] - X[None], axis=2)
 
         effective_k = min(self.k, n - 1)
-        knn_idx = np.argsort(dists, axis=1)[:, 1:effective_k + 1]  # skip self (col 0)
+        knn_idx = np.argsort(dists, axis=1)[:, 1:effective_k + 1]
 
-        # ---------------------------------------------------------------------
-        # 2. Compute Gaussian edge weights (or log/power transformed)
-        # ---------------------------------------------------------------------
+        # 2️Compute Gaussian weights
         if self.sigma is None:
             med_dist = np.median(dists[np.triu_indices(n, 1)])
-            sigma = 0.2 * med_dist  # heuristic: 20% of median distance
+            sigma = 0.2 * med_dist
         else:
             sigma = self.sigma
         self.sigma = sigma
@@ -98,87 +94,94 @@ class FluxEquilibriumClustering:
                 w = np.exp(-((dist / sigma) ** 2))
                 w_ij[i, idx] = w
 
-        # Apply beta transformation if required
+        # Apply beta or log weighting
         if self.beta is not None:
             if self.beta == 0:
-                pass  # keep as-is (original FEC)
+                pass
             else:
                 w_ij = np.power(w_ij, self.beta)
         else:
             w_ij = np.log1p(w_ij)
 
-        # ---------------------------------------------------------------------
-        # 3. Compute local density proxy (sum of edge weights)
-        # ---------------------------------------------------------------------
+        # 3️Local density (sum of weights)
         local_density = w_ij.sum(axis=1)
 
-        # ---------------------------------------------------------------------
-        # 4. Initialize flux and perform T redistribution iterations
-        # ---------------------------------------------------------------------
-        flux = np.ones(n)
+        # Detect potential separate clusters: split based on median distance
+        median_d = np.median(dists_to_centroid)
+        cluster_hint = dists_to_centroid > median_d  # True = likely far cluster
 
+        # 4️Flux transport iterations
+        flux = np.ones(n)
         for t in range(self.T):
             new_flux = np.zeros(n)
-
             for i in range(n):
-                # Find neighbors that are denser (local flow direction)
-                downhill_indices = [idx for idx, j in enumerate(knn_idx[i])
-                                    if local_density[j] > local_density[i]]
+                downhill_indices = []
+                for idx, j in enumerate(knn_idx[i]):
+                    # Hybrid downhill criterion:
+                    #  - For near-centroid points → flow toward smaller centroid distance
+                    #  - For far points (second cluster) → flow toward *local* denser neighbors
+                    if not cluster_hint[i]:
+                        if dists_to_centroid[j] < dists_to_centroid[i]:
+                            downhill_indices.append(idx)
+                    else:
+                        if local_density[j] > local_density[i]:
+                            downhill_indices.append(idx)
 
                 if downhill_indices:
-                    # Distribute alpha fraction of flux equally to denser neighbors
                     out_share = self.alpha * flux[i] / len(downhill_indices)
                     for idx in downhill_indices:
                         new_flux[knn_idx[i][idx]] += out_share
-                    # Retain remaining flux
                     new_flux[i] += (1 - self.alpha) * flux[i]
                 else:
-                    # No denser neighbor → retain all flux
                     new_flux[i] += flux[i]
+            flux = new_flux
 
-            flux = new_flux  # update for next iteration
-
-        # ---------------------------------------------------------------------
-        # 5. Identify sinks (no denser neighbors)
-        # ---------------------------------------------------------------------
+        # Detect sinks (no valid downhill neighbors)
         sinks = []
         for i in range(n):
-            downhill_indices = [idx for idx, j in enumerate(knn_idx[i])
-                                if local_density[j] > local_density[i]]
+            downhill_indices = []
+            for idx, j in enumerate(knn_idx[i]):
+                if not cluster_hint[i]:
+                    if dists_to_centroid[j] < dists_to_centroid[i]:
+                        downhill_indices.append(idx)
+                else:
+                    if local_density[j] > local_density[i]:
+                        downhill_indices.append(idx)
             if not downhill_indices:
                 sinks.append(i)
 
-        # ---------------------------------------------------------------------
-        # 6. Assign cluster labels by following steepest ascent paths
-        # ---------------------------------------------------------------------
+        # Assign cluster labels
         labels = -np.ones(n, dtype=int)
         sink_map = {sink: idx for idx, sink in enumerate(sinks)}
-
         for i in range(n):
             visited = set()
             curr = i
             while curr not in sinks:
                 visited.add(curr)
-                # Move to the neighbor with the highest local density
-                uphill_indices = [idx for idx, j in enumerate(knn_idx[curr])
-                                  if local_density[j] > local_density[curr]]
-                if not uphill_indices:
+                downhill_indices = []
+                for idx, j in enumerate(knn_idx[curr]):
+                    if not cluster_hint[curr]:
+                        if dists_to_centroid[j] < dists_to_centroid[curr]:
+                            downhill_indices.append(idx)
+                    else:
+                        if local_density[j] > local_density[curr]:
+                            downhill_indices.append(idx)
+                if not downhill_indices:
                     break
-                # Choose the steepest ascent (most dense neighbor)
-                idx_steep = max(uphill_indices, key=lambda idx: local_density[knn_idx[curr][idx]])
+                idx_steep = min(
+                    downhill_indices,
+                    key=lambda idx: dists_to_centroid[knn_idx[curr][idx]],
+                )
                 next_c = knn_idx[curr][idx_steep]
                 if next_c in visited:
-                    break  # avoid cycles
+                    break
                 curr = next_c
-
             if curr in sinks:
                 labels[i] = sink_map[curr]
             else:
-                labels[i] = -1  # unassigned/outlier
+                labels[i] = -1
 
-        # ---------------------------------------------------------------------
-        # 7. Store final model attributes
-        # ---------------------------------------------------------------------
+        # Final attributes
         sink_mask = np.zeros(n, dtype=bool)
         sink_mask[sinks] = True
 
@@ -186,9 +189,7 @@ class FluxEquilibriumClustering:
         self.flux = flux
         self.sinks = sink_mask
         self.labels = labels
-
         return self
-
     # -------------------------------------------------------------------------
     # Convenience method
     # -------------------------------------------------------------------------
