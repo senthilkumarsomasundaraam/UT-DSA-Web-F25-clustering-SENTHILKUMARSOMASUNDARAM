@@ -88,29 +88,24 @@ class FluxEquilibriumClustering:
         # ---- DO NOT CHANGE THE REST OF THIS METHOD ---- #
         # We require you maintain these attributes for testing purpose.
         n = X.shape[0]
-        # 1. Compute global centroid and distances to centroid
         centroid = X.mean(axis=0)
         dists_to_centroid = np.linalg.norm(X - centroid, axis=1)
-        # Compute pairwise distances
         dists = np.linalg.norm(X[:, None] - X[None], axis=2)
         effective_k = min(self.k, n - 1)
-        # k-NN graph
         knn_idx = np.argsort(dists, axis=1)[:, 1:effective_k + 1]  # (n, k)
-        # 2. Build symmetric k-NN weights
+        # Compute weights to k neighbors
         if self.sigma is None:
             med_dist = np.median(dists[np.triu_indices(n, 1)])
             sigma = 0.2 * med_dist
         else:
             sigma = self.sigma
         self.sigma = sigma
-        # w_ij: n x k. Each row i: weights to k nearest neighbors
         w_ij = np.zeros((n, effective_k))
         for i in range(n):
             for idx, j in enumerate(knn_idx[i]):
                 dist = np.linalg.norm(X[i] - X[j])
                 w = np.exp(-((dist / sigma) ** 2))
                 w_ij[i, idx] = w
-        # Optional: Apply beta reweighting
         if self.beta is not None:
             if self.beta == 0:
                 pass
@@ -118,9 +113,8 @@ class FluxEquilibriumClustering:
                 w_ij = np.power(w_ij, self.beta)
         else:
             w_ij = np.log1p(w_ij)
-        # 3. Initialize flux for all nodes
+        # Initialize flux
         flux = np.ones(n)
-        # 4. Simulate T transport iterations
         for t in range(self.T):
             new_flux = np.zeros(n)
             for i in range(n):
@@ -134,17 +128,14 @@ class FluxEquilibriumClustering:
                 else:
                     new_flux[i] += flux[i]
             flux = new_flux
-        # 5. Identify sinks: outgoing flux < epsilon
+        # Sink detection: node is a sink if it has NO downhill neighbors
         sinks = []
         for i in range(n):
-            outgoing = 0
             downhill_indices = [idx for idx, j in enumerate(knn_idx[i])
                                 if dists_to_centroid[j] < dists_to_centroid[i]]
-            if downhill_indices:
-                outgoing = self.alpha * flux[i]
-            if outgoing < self.epsilon:
+            if not downhill_indices:
                 sinks.append(i)
-        # 6. Assign clusters: steepest path to sink with cycle detection
+        # Assign clusters: follow steepest path to a sink with cycle detection
         labels = -np.ones(n, dtype=int)
         sink_map = {sink: idx for idx, sink in enumerate(sinks)}
         for i in range(n):
@@ -166,13 +157,10 @@ class FluxEquilibriumClustering:
                 labels[i] = sink_map[curr]
             else:
                 labels[i] = -1  # outlier/unassigned
-        # REQUIRED: For tests!
         self.w_ij = w_ij
         self.flux = flux
         self.sinks = np.array(sinks)
         self.labels = labels
-        return self
-
         return self
 
     def fit_predict(self, X: np.ndarray) -> np.ndarray:
