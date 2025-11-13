@@ -1,5 +1,3 @@
-from __future__ import annotations
-from typing import Optional
 import numpy as np
 
 
@@ -29,18 +27,25 @@ class FluxEquilibriumClustering:
         * ``beta is None``  –  use ``phi(f) = log(1+f)`` (recommended).
         * ``beta = 0``      –  recovers the *original* FEC behaviour.
         * any other value   –  use ``phi(f) = f**beta``.
+
+    Notes
+    -----
+    Implementation hints for better clustering:
+    - Handle small datasets: ensure k <= n-1 to avoid boundary errors
+    - Consider relaxed downhill flow: allow flux to similar-distance neighbors
+    - Add cycle detection in path-following to prevent infinite loops
+    - Post-process: merge very small clusters with nearest larger ones
     """
 
     def __init__(
         self,
-        k: int = 10,
-        sigma: Optional[float] = None,
-        alpha: float = 0.5,
-        T: int = 25,
-        epsilon: float = 1e-4,
-        beta: Optional[float] = None,
-    ) -> None:
-        # Initialize parameters
+        k=10,
+        sigma=None,
+        alpha=0.5,
+        T=25,
+        epsilon=1e-4,
+        beta=None,
+    ):
         self.k = k
         self.sigma = sigma
         self.alpha = alpha
@@ -48,62 +53,54 @@ class FluxEquilibriumClustering:
         self.epsilon = epsilon
         self.beta = beta
 
-        # Attributes set after fit()
-        self.labels = None
-        self.w_ij = None
-        self.flux = None
-        self.sinks = None
-
-    def fit(self, X: np.ndarray) -> "FluxEquilibriumClustering":
-        """Compute cluster labels for X using flux-based equilibrium."""
-
+    def fit(self, X):
+        """Compute cluster labels for *X*."""
+        
         n = X.shape[0]
-
-        # --- Step 1: Build k-NN graph ---
-        dists = np.linalg.norm(X[:, None] - X[None], axis=2)
+        
+        # Step 1: Compute centroid and distances
+        centroid = X.mean(axis=0)
+        dists_to_centroid = np.linalg.norm(X - centroid, axis=1)
+        dists = np.linalg.norm(X[:, None] - X[None, :], axis=2)
+        
+        # Step 2: Build k-NN graph
         effective_k = min(self.k, n - 1)
         knn_idx = np.argsort(dists, axis=1)[:, 1:effective_k + 1]
-
-        # Compute centroid for downhill direction
-        centroid = np.mean(X, axis=0)
-        dists_to_centroid = np.linalg.norm(X - centroid, axis=1)
-
-        # Determine sigma if not provided
+        
+        # Infer sigma if not provided
         if self.sigma is None:
-            # Use median of k-NN distances for better adaptation
             knn_dists = np.array([dists[i, knn_idx[i]] for i in range(n)])
             med_dist = np.median(knn_dists)
             sigma = 0.2 * med_dist if med_dist > 0 else 1.0
         else:
             sigma = self.sigma
         self.sigma = sigma
-
+        
         # Gaussian edge weights
         w_ij = np.zeros((n, effective_k))
         for i in range(n):
             for idx, j in enumerate(knn_idx[i]):
                 w_ij[i, idx] = np.exp(-((dists[i, j] / sigma) ** 2))
-
-        self.w_ij = w_ij
-
-        # --- Step 2: Initialize flux ---
+        
+        # Step 3: Initialize flux
         flux = np.ones(n)
-
-        # Adaptive downhill tolerance
+        
+        # Relaxed downhill tolerance
         std_dist = np.std(dists_to_centroid)
         downhill_tol = 0.05 * std_dist if std_dist > 0 else 0.1
-
-        # --- Step 3: Flux transport iterations ---
+        
+        # Step 4: Flux transport iterations
         for t in range(self.T):
             new_flux = np.zeros(n)
+            
             for i in range(n):
                 neighbors = knn_idx[i]
                 my_d = dists_to_centroid[i]
                 
-                # Identify downhill neighbors (toward centroid)
+                # Relaxed downhill: neighbors closer to centroid
                 downhill = neighbors[dists_to_centroid[neighbors] < my_d + downhill_tol]
-
-                # Edge weighting based on iteration
+                
+                # Flux-aware edge weighting
                 raw_weights = w_ij[i][:len(neighbors)]
                 if t == 0 or self.beta == 0:
                     edge_w = raw_weights
@@ -111,124 +108,106 @@ class FluxEquilibriumClustering:
                     edge_w = np.log1p(raw_weights) * flux[neighbors]
                 else:
                     edge_w = np.power(raw_weights, self.beta) * flux[neighbors]
-
-                # Only use downhill edges
+                
+                # Only downhill edges
                 edge_w = edge_w * np.isin(neighbors, downhill)
                 out_sum = np.sum(edge_w)
-
+                
                 if out_sum > 0:
-                    # Distribute flux proportionally
                     qty = self.alpha * flux[i]
                     new_fluxes = edge_w / out_sum * qty
                     for idx, j in enumerate(neighbors):
                         new_flux[j] += new_fluxes[idx]
-
-                # Keep remainder at current node
+                
                 new_flux[i] += (1 - self.alpha) * flux[i]
-
+            
             flux = new_flux
-
-            # Early stopping if converged
-            if t > 0 and np.allclose(flux, new_flux, rtol=1e-3):
-                break
-
+        
         # Normalize flux
         max_flux = np.max(flux)
         if max_flux > 0:
             flux = flux / max_flux
-
-        # --- Step 4: Sink detection ---
+        
+        # Step 5: Identify sinks
         outgoing_flux = np.zeros(n)
         for i in range(n):
             neighbors = knn_idx[i]
             downhill = neighbors[dists_to_centroid[neighbors] < dists_to_centroid[i] + downhill_tol]
             out_flux = np.sum([flux[i] - flux[j] for j in downhill if flux[i] > flux[j]])
             outgoing_flux[i] = out_flux
-
-        # Adaptive threshold for sink detection
+        
+        # Adaptive epsilon threshold
         adaptive_epsilon = self.epsilon * np.max(flux) * 0.1
         potential_sinks = np.where(outgoing_flux < adaptive_epsilon)[0]
-
-        # Filter if too many sinks detected
+        
+        # Filter if too many sinks
         if len(potential_sinks) > max(2, n // 10):
             sink_fluxes = flux[potential_sinks]
             flux_threshold = np.percentile(sink_fluxes, 70)
-            sinks = potential_sinks[sink_fluxes >= flux_threshold]
+            sink_list = potential_sinks[sink_fluxes >= flux_threshold].tolist()
         else:
-            sinks = potential_sinks
-
-        # Fallback: if no sinks, use flux-based detection
-        if len(sinks) == 0:
+            sink_list = potential_sinks.tolist()
+        
+        # Fallback if no sinks found
+        if len(sink_list) == 0:
             flux_threshold = np.percentile(flux, 90)
             high_flux_points = np.where(flux >= flux_threshold)[0]
-
-            # Find local maxima
-            local_max_sinks = []
+            
             for candidate in high_flux_points:
                 neighbors = knn_idx[candidate]
                 if len(neighbors) == 0 or flux[candidate] >= np.max(flux[neighbors]):
-                    local_max_sinks.append(candidate)
-
-            if local_max_sinks:
-                sinks = np.array(local_max_sinks)
-            else:
-                sinks = np.array([np.argmax(flux)])
-
-        # --- Step 5: Assign labels via steepest descent to sinks ---
+                    sink_list.append(candidate)
+            
+            if len(sink_list) == 0:
+                sink_list = [int(np.argmax(flux))]
+        
+        # Step 6: Assign labels via steepest paths with cycle detection
         labels = -np.ones(n, dtype=int)
-        sink_map = {sink: idx for idx, sink in enumerate(sinks)}
-
-        # Label sinks first
+        sink_map = {sink: idx for idx, sink in enumerate(sink_list)}
+        
         for sink, idx in sink_map.items():
             labels[sink] = idx
-
-        # Assign remaining points
+        
         for i in range(n):
             if labels[i] != -1:
                 continue
-
+            
             path = []
             current = i
             visited = set()
-
+            
             while True:
                 path.append(current)
                 visited.add(current)
-
-                # Already labeled?
+                
                 if labels[current] != -1:
                     root_label = labels[current]
                     break
-
+                
                 neighbors = knn_idx[current]
                 downhill = neighbors[dists_to_centroid[neighbors] < dists_to_centroid[current] + downhill_tol]
-
+                
                 if len(downhill) == 0:
-                    # No downhill path - assign to nearest sink
+                    # Assign to nearest sink
                     if len(sink_map) > 0:
                         sink_indices = list(sink_map.keys())
-                        nearest_sink = min(sink_indices,
-                                         key=lambda s: np.linalg.norm(X[current] - X[s]))
+                        nearest_sink = min(sink_indices, key=lambda s: dists[current, s])
                         labels[current] = sink_map[nearest_sink]
                         root_label = sink_map[nearest_sink]
                     else:
-                        # Create new sink
                         new_sink_idx = len(sink_map)
                         sink_map[current] = new_sink_idx
                         labels[current] = new_sink_idx
                         root_label = new_sink_idx
                     break
-
-                # Follow steepest descent
+                
                 steepest = downhill[np.argmin(dists_to_centroid[downhill])]
-
+                
                 # Cycle detection
                 if steepest in visited:
-                    # Assign to nearest sink
                     if len(sink_map) > 0:
                         sink_indices = list(sink_map.keys())
-                        nearest_sink = min(sink_indices,
-                                         key=lambda s: np.linalg.norm(X[steepest] - X[s]))
+                        nearest_sink = min(sink_indices, key=lambda s: dists[steepest, s])
                         labels[steepest] = sink_map[nearest_sink]
                         root_label = sink_map[nearest_sink]
                     else:
@@ -237,27 +216,25 @@ class FluxEquilibriumClustering:
                         labels[steepest] = new_sink_idx
                         root_label = new_sink_idx
                     break
-
+                
                 current = steepest
-
-            # Propagate label to entire path
+            
             for node in path:
                 if labels[node] == -1:
                     labels[node] = root_label
-
-        # --- Step 6: Merge small clusters ---
+        
+        # Post-process: merge small clusters
         smin = max(5, n // 15)
-
-        for iteration in range(10):
+        
+        for _ in range(10):
             unique_labels, counts = np.unique(labels, return_counts=True)
             small_labels = unique_labels[counts < smin]
-
+            
             if len(small_labels) == 0:
                 break
-
+            
             large_labels = unique_labels[counts >= smin]
-
-            # If all clusters small, keep largest ones
+            
             if len(large_labels) == 0:
                 if len(unique_labels) <= 2:
                     break
@@ -265,60 +242,63 @@ class FluxEquilibriumClustering:
                 large_labels = unique_labels[counts >= threshold_size]
                 if len(large_labels) == 0:
                     break
-
+            
             merged_any = False
             for lbl in small_labels:
                 cluster_pts = np.where(labels == lbl)[0]
                 if len(cluster_pts) == 0:
                     continue
-
+                
                 cluster_centroid = np.mean(X[cluster_pts], axis=0)
                 best_label = None
                 best_dist = np.inf
-
+                
                 for other in large_labels:
                     if other == lbl:
                         continue
-
+                    
                     other_pts = np.where(labels == other)[0]
                     if len(other_pts) == 0:
                         continue
-
+                    
                     other_centroid = np.mean(X[other_pts], axis=0)
                     d = np.linalg.norm(cluster_centroid - other_centroid)
-
+                    
                     if d < best_dist:
                         best_dist = d
                         best_label = other
-
+                
                 if best_label is not None:
                     labels[cluster_pts] = best_label
                     merged_any = True
-
+            
             if not merged_any:
                 break
-
+        
         # Relabel to consecutive integers
         unique_labels = np.unique(labels)
         label_mapping = {old: new for new, old in enumerate(unique_labels)}
         labels = np.array([label_mapping[lbl] for lbl in labels])
+        
+        # Create sinks boolean array
+        sinks = np.zeros(n, dtype=bool)
+        sinks[list(sink_map.keys())] = True
 
-        # Store attributes for tests
-        sink_mask = np.zeros(n, dtype=bool)
-        sink_mask[list(sink_map.keys())] = True
-
+        # ---- DO NOT CHANGE THE REST OF THIS METHOD ---- #
+        # We require you maintain these attributes for testing purpose.
+        self.w_ij = w_ij
         self.flux = flux
-        self.sinks = sink_mask
+        self.sinks = sinks
         self.labels = labels
 
         return self
 
-    def fit_predict(self, X: np.ndarray) -> np.ndarray:
-        """Convenience method returning cluster labels."""
+    def fit_predict(self, X):
+        """Convenience method that returns the cluster labels."""
         self.fit(X)
         return self.labels
 
-    def __repr__(self) -> str:
+    def __repr__(self):
         params = (
             f"k={getattr(self, 'k', '?')}",
             f"sigma={getattr(self, 'sigma', '?')}",
