@@ -190,3 +190,15 @@ class FluxEquilibriumClustering:
     def fit_predict(self, X):
         self.fit(X)
         return self.labels
+
+    def __repr__(self) -> str:
+        params = (
+            f"k={getattr(self, 'k', '?')}",
+            f"sigma={getattr(self, 'sigma', '?')}",
+            f"alpha={getattr(self, 'alpha', '?')}",
+            f"T={getattr(self, 'T', '?')}",
+            f"epsilon={getattr(self, 'epsilon', '?')}",
+            f"beta={getattr(self, 'beta', '?')}",
+        )
+        return f"{self.__class__.__name__}({', '.join(params)})"
+
